@@ -1,36 +1,32 @@
 package com.map.vectra
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.shrinkVertically
+import android.content.res.Configuration
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
+import java.util.Locale
 import kotlin.math.*
 
 @Composable
@@ -39,344 +35,542 @@ fun ViewerScreen(
     onBack: () -> Unit,
     onOpenEditor: () -> Unit,
     onExport: () -> Unit,
-    onUpdatePoint: (Int, Float, Float) -> Unit,
+    onUpdatePoint: (Int, Double, Double) -> Unit,
     onSaveState: () -> Unit,
     onUndo: () -> Unit,
     canUndo: Boolean
 ) {
-    // --- State Holders ---
-    // Critical: Update state refs so gestures always use latest data
     val currentPoints by rememberUpdatedState(points)
     val currentOnUpdatePoint by rememberUpdatedState(onUpdatePoint)
+    val viewModel: VectraViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val configuration = LocalConfiguration.current
+    val isPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
 
-    // View Transform
+    val customLines by viewModel.lines
+    var show3DView by remember { mutableStateOf(false) }
+
+    // --- State: Manual Camera & Projection ---
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var rotation by remember { mutableFloatStateOf(0f) }
 
-    // Selection
+    var originX by remember { mutableDoubleStateOf(0.0) }
+    var originY by remember { mutableDoubleStateOf(0.0) }
+    var latScaleFactor by remember { mutableDoubleStateOf(1.0) } // NEW: GPS Aspect Ratio Fix
+    var isOriginSet by remember { mutableStateOf(false) }
+    var isInitialFitDone by remember { mutableStateOf(false) }
+
+    // Selection & Locks
     var selectedPointIndex by remember { mutableIntStateOf(-1) }
     var selectedLineIndex by remember { mutableIntStateOf(-1) }
+    var lockedPointIndex by remember { mutableIntStateOf(-1) } // NEW: Pinned pivot point
+
+    // Area
+    var isAreaMode by remember { mutableStateOf(false) }
+    val selectedAreaIndices = remember { mutableStateListOf<Int>() }
     var selectedAreaInfo by remember { mutableStateOf<String?>(null) }
     var selectedAreaPos by remember { mutableStateOf<PointData?>(null) }
+
     var showLines by remember { mutableStateOf(true) }
 
-    // UI State - Default OPEN
-    var isMenuExpanded by remember { mutableStateOf(true) }
-    val textMeasurer = rememberTextMeasurer()
+    // Modes
+    var isAddMode by remember { mutableStateOf(false) }
+    var isConnectModePending by remember { mutableStateOf(false) }
 
-    // Colors
+    // Canvas Control Locks
+    var lockScroll by remember { mutableStateOf(false) }
+    var lockRotation by remember { mutableStateOf(false) }
+    var lockZoom by remember { mutableStateOf(false) }
+
+    val textMeasurer = rememberTextMeasurer()
     val backgroundColor = MaterialTheme.colorScheme.surface
-    val gridLineColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
     val dotColor = MaterialTheme.colorScheme.primary
     val selectedColor = Color.Yellow
+    val areaSelectedDotColor = Color.Red
     val lineColor = MaterialTheme.colorScheme.secondary
-    val textColor = MaterialTheme.colorScheme.onSurface
+    val customLineColor = MaterialTheme.colorScheme.tertiary
+    val areaPreviewLineColor = Color.Red.copy(alpha = 0.5f)
 
-    // --- Helpers ---
-    fun screenToWorld(touch: Offset): PointData {
-        val dx = touch.x - offset.x
-        val dy = touch.y - offset.y
-        val rad = -rotation * (PI / 180f)
-        val cos = cos(rad)
-        val sin = sin(rad)
-        val rotatedX = (dx * cos - dy * sin)
-        val rotatedY = (dx * sin + dy * cos)
-        val worldX = rotatedX / scale
-        val worldY = rotatedY / scale
-        return PointData(0, worldX.toFloat(), worldY.toFloat())
+    if (show3DView) {
+        ViewScreen(
+            points = currentPoints,
+            customLines = customLines,
+            onBack = { show3DView = false }
+        )
+        return
     }
 
-    fun worldToScreen(p: PointData): Offset {
-        val rad = rotation * (PI / 180f)
-        val cos = cos(rad)
-        val sin = sin(rad)
-        val wx = p.x * scale
-        val wy = p.y * scale
-        val rx = (wx * cos - wy * sin)
-        val ry = (wx * sin + wy * cos)
-        return Offset((rx + offset.x).toFloat(), (ry + offset.y).toFloat())
+    // Mathematical Distance for Google Earth Real Coordinates
+    fun earthDistanceMeters(p1: PointData, p2: PointData): Double {
+        val earthRadius = 6378137.0
+        val lat1 = p1.y * (PI / 180.0)
+        val lat2 = p2.y * (PI / 180.0)
+        val dLat = (p2.y - p1.y) * (PI / 180.0)
+        val dLon = (p2.x - p1.x) * (PI / 180.0)
+        val a = sin(dLat / 2) * sin(dLat / 2) +
+                cos(lat1) * cos(lat2) *
+                sin(dLon / 2) * sin(dLon / 2)
+        val c = 2 * atan2(sqrt(a), sqrt(1.0 - a))
+        return earthRadius * c
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(backgroundColor)) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(backgroundColor)) {
+        val canvasWidth = constraints.maxWidth.toFloat()
+        val canvasHeight = constraints.maxHeight.toFloat()
+        val validPoints = remember(currentPoints) { currentPoints.filter { it.x.isFinite() && it.y.isFinite() } }
+
+        // Core Fix: High-Precision Origin & GPS Aspect Ratio
+        LaunchedEffect(validPoints) {
+            if (!isInitialFitDone && validPoints.isNotEmpty() && canvasWidth > 0) {
+                val minX = validPoints.minOf { it.x }
+                val maxX = validPoints.maxOf { it.x }
+                val minY = validPoints.minOf { it.y }
+                val maxY = validPoints.maxOf { it.y }
+
+                if (!isOriginSet) {
+                    originX = (minX + maxX) / 2.0
+                    originY = (minY + maxY) / 2.0
+
+                    // Detect if data is GPS (Lat/Lon). If so, fix the aspect ratio curvature.
+                    val isGPS = validPoints.all { abs(it.x) <= 180.0 && abs(it.y) <= 90.0 }
+                    latScaleFactor = if (isGPS) cos(originY * (PI / 180.0)) else 1.0
+
+                    isOriginSet = true
+                }
+
+                // Apply the LatScaleFactor so the bounding box fits properly
+                val diffX = ((maxX - minX) * latScaleFactor).coerceAtLeast(0.000001)
+                val diffY = (maxY - minY).coerceAtLeast(0.000001)
+
+                val scaleX = (canvasWidth * 0.7) / diffX
+                val scaleY = (canvasHeight * 0.7) / diffY
+                scale = min(scaleX, scaleY).toFloat().coerceIn(0.1f, 1000000000f)
+
+                offset = Offset.Zero
+                isInitialFitDone = true
+            }
+        }
+
+        fun worldToScreen(p: PointData): Offset {
+            val dx = (p.x - originX) * latScaleFactor * scale.toDouble()
+            val dy = -(p.y - originY) * scale.toDouble()
+
+            val rad = rotation * (PI / 180.0)
+            val cosVal = cos(rad)
+            val sinVal = sin(rad)
+
+            val rx = dx * cosVal - dy * sinVal
+            val ry = dx * sinVal + dy * cosVal
+
+            return Offset(
+                (rx + (canvasWidth / 2.0) + offset.x).toFloat(),
+                (ry + (canvasHeight / 2.0) + offset.y).toFloat()
+            )
+        }
+
+        fun screenToWorld(pos: Offset): PointData {
+            val rx = pos.x - (canvasWidth / 2f) - offset.x
+            val ry = pos.y - (canvasHeight / 2f) - offset.y
+
+            val rad = -rotation * (PI / 180.0)
+            val cosVal = cos(rad)
+            val sinVal = sin(rad)
+
+            val sx = rx * cosVal - ry * sinVal
+            val sy = rx * sinVal + ry * cosVal
+
+            val dx = sx / (scale.toDouble() * latScaleFactor)
+            val dy = -(sy / scale.toDouble())
+
+            return PointData(0, dx + originX, dy + originY)
+        }
+
+        fun isSafeToDraw(screenPos: Offset): Boolean {
+            val buffer = 2000f
+            return screenPos.x.isFinite() && screenPos.y.isFinite() &&
+                    screenPos.x > -buffer && screenPos.x < canvasWidth + buffer &&
+                    screenPos.y > -buffer && screenPos.y < canvasHeight + buffer
+        }
 
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                // --- LAYER 1: SCREEN TRANSFORM (Background) ---
-                // This handles panning/zooming ONLY if the event wasn't consumed by Layer 2
-                .pointerInput(Unit) {
+                .pointerInput(lockScroll, lockRotation, lockZoom) {
                     detectTransformGestures { centroid, pan, zoom, rotate ->
+                        val actualZoom = if (lockZoom) 1f else zoom
+                        val actualRotate = if (lockRotation) 0f else rotate
+                        val actualPan = if (lockScroll) Offset.Zero else pan
+
                         val oldScale = scale
-                        scale *= zoom
-                        scale = scale.coerceIn(0.1f, 1000f)
+                        scale = (scale * actualZoom).coerceIn(0.1f, 1000000000f)
+                        val zoomFactor = scale / oldScale
 
-                        val rad = rotate * (PI / 180f)
-                        val cos = cos(rad)
-                        val sin = sin(rad)
+                        rotation += actualRotate
 
-                        val cx = centroid.x - offset.x
-                        val cy = centroid.y - offset.y
-                        val newCx = cx * cos - cy * sin
-                        val newCy = cx * sin + cy * cos
-                        val rotOffsetX = cx - newCx
-                        val rotOffsetY = cy - newCy
+                        val cx = centroid.x - (canvasWidth / 2f)
+                        val cy = centroid.y - (canvasHeight / 2f)
+                        val dx = (offset.x - cx) * zoomFactor
+                        val dy = (offset.y - cy) * zoomFactor
 
-                        rotation += rotate
+                        val rad = (actualRotate * (PI / 180.0)).toFloat()
+                        val cosVal = cos(rad)
+                        val sinVal = sin(rad)
 
-                        val totalPanX = pan.x + rotOffsetX.toFloat()
-                        val totalPanY = pan.y + rotOffsetY.toFloat()
+                        val rx = dx * cosVal - dy * sinVal
+                        val ry = dx * sinVal + dy * cosVal
 
-                        offset += Offset(totalPanX, totalPanY)
+                        offset = Offset(rx + cx + actualPan.x, ry + cy + actualPan.y)
                     }
                 }
-                // --- LAYER 2: POINT INTERACTION (Foreground) ---
-                // This logic runs "on top". If we hit a point, we consume events so Layer 1 doesn't see them.
-                .pointerInput(Unit) {
+                .pointerInput(isAddMode, isConnectModePending, isAreaMode, selectedPointIndex, lockedPointIndex) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val worldPos = screenToWorld(down.position)
-                        val hitRadius = (50f / scale).coerceAtLeast(20f) // Generous hit area
 
-                        // 1. Check Point Hit
-                        val hitIndex = currentPoints.indexOfFirst {
-                            CsvDxfUtils.distance(it, worldPos) < hitRadius
+                        val hitRadius = (50.0 / scale.toDouble())
+
+                        var hitPointIndex = currentPoints.indexOfFirst {
+                            it.x.isFinite() && it.y.isFinite() &&
+                                    CsvDxfUtils.distance(it, worldPos) < hitRadius
                         }
 
-                        if (hitIndex != -1) {
-                            // --- HIT: POINT DETECTED ---
-                            // 1. Consume the DOWN event immediately.
-                            // This stops Layer 1 (Transform) from starting a pan/zoom.
+                        if (isAreaMode) {
                             down.consume()
-
-                            // 2. Select Point (Yellow)
-                            selectedPointIndex = hitIndex
-                            selectedLineIndex = -1
-                            selectedAreaInfo = null
-                            onSaveState() // Save history for Undo
-
-                            // 3. Enter Drag Loop
-                            // We manually track the pointer to ensure unrestricted movement
-                            var dragPointerId = down.id
-
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.find { it.id == dragPointerId }
-
-                                if (change == null || !change.pressed) {
-                                    break // Finger lifted
+                            val up = waitForUpOrCancellation()
+                            if (up != null && hitPointIndex != -1) {
+                                if (selectedAreaIndices.contains(hitPointIndex)) {
+                                    selectedAreaIndices.remove(hitPointIndex)
+                                } else {
+                                    selectedAreaIndices.add(hitPointIndex)
                                 }
-
-                                val dragAmount = change.position - change.previousPosition
-                                if (dragAmount.getDistance() > 0f) {
-                                    // Calculate movement in World Space
-                                    val rad = -rotation * (PI / 180f)
-                                    val rotDx = (dragAmount.x * cos(rad) - dragAmount.y * sin(rad)).toFloat()
-                                    val rotDy = (dragAmount.x * sin(rad) + dragAmount.y * cos(rad)).toFloat()
-
-                                    // Update Point directly
-                                    if (hitIndex < currentPoints.size) {
-                                        val curr = currentPoints[hitIndex]
-                                        val newX = curr.x + (rotDx / scale)
-                                        val newY = curr.y + (rotDy / scale)
-
-                                        // CRASH FIX: Ensure coordinates are finite (not NaN or Infinite)
-                                        // This prevents crashes when points overlap or math breaks in negative coordinates
-                                        if (newX.isFinite() && newY.isFinite()) {
-                                            currentOnUpdatePoint(hitIndex, newX, newY)
-                                        }
-                                    }
-                                }
-                                // Consume EVERY move event so the screen never scrolls
-                                change.consume()
+                                selectedAreaInfo = null
                             }
                         } else {
-                            // --- MISS: CHECK TAP LOGIC ---
-                            // We didn't hit a point. We DO NOT consume the down event.
-                            // We let Layer 1 handle the Pan/Zoom.
-                            // BUT, we need to handle "Single Tap on Empty Space" to deselect.
-                            // We can wait to see if it was just a tap (no drag).
-
-                            val up = waitForUpOrCancellation()
-                            if (up != null) {
-                                // It was a tap (finger went down and up without significant move consumed elsewhere)
-                                // Handle Deselection / Line Selection / Area
-                                val tapPoint = screenToWorld(up.position)
-
-                                // Check Lines
-                                var lineFound = false
-                                if (showLines && currentPoints.size > 1) {
-                                    for (i in 0 until currentPoints.size - 1) {
-                                        if (CsvDxfUtils.distanceToSegment(tapPoint, currentPoints[i], currentPoints[i + 1]) < hitRadius) {
-                                            selectedLineIndex = if (selectedLineIndex == i) -1 else i
-                                            selectedPointIndex = -1
-                                            selectedAreaInfo = null
-                                            lineFound = true
+                            var hitLineIndex = -1
+                            if (hitPointIndex == -1 && showLines && currentPoints.size > 1) {
+                                for (i in 0 until currentPoints.size - 1) {
+                                    val p1 = currentPoints[i]
+                                    val p2 = currentPoints[i + 1]
+                                    if (p1.x.isFinite() && p1.y.isFinite() && p2.x.isFinite() && p2.y.isFinite()) {
+                                        if (CsvDxfUtils.distanceToSegment(worldPos, p1, p2) < hitRadius) {
+                                            hitLineIndex = i
                                             break
                                         }
                                     }
                                 }
+                            }
 
-                                // Check Area
-                                if (!lineFound && currentPoints.size >= 4) {
-                                    if (CsvDxfUtils.isInsidePolygon(tapPoint, currentPoints)) {
-                                        if (selectedAreaInfo == null) {
-                                            val area = CsvDxfUtils.calculatePolygonArea(currentPoints)
-                                            selectedAreaInfo = "Area: ${"%.2f".format(area)}"
-                                            selectedAreaPos = tapPoint
-                                            selectedPointIndex = -1
-                                            selectedLineIndex = -1
-                                        } else {
-                                            selectedAreaInfo = null
+                            if (hitPointIndex != -1 || hitLineIndex != -1) {
+                                down.consume()
+
+                                if (isConnectModePending && hitPointIndex != -1) {
+                                    if (selectedPointIndex != -1 && selectedPointIndex != hitPointIndex) {
+                                        viewModel.connectPoints(selectedPointIndex, hitPointIndex)
+                                        selectedPointIndex = -1
+                                        isConnectModePending = false
+                                    }
+                                } else {
+                                    onSaveState()
+                                    if (hitPointIndex != -1) {
+                                        selectedPointIndex = hitPointIndex
+                                        selectedLineIndex = -1
+                                        selectedAreaInfo = null
+                                    } else {
+                                        selectedLineIndex = hitLineIndex
+                                        selectedPointIndex = -1
+                                        selectedAreaInfo = null
+                                    }
+                                    isConnectModePending = false
+                                }
+
+                                // Identify all points that need to move (treating overlapped points as a single entity)
+                                val indicesToMove = mutableSetOf<Int>()
+                                val initialPositions = mutableMapOf<Int, PointData>()
+
+                                if (hitPointIndex != -1) {
+                                    val initialSelected = currentPoints[hitPointIndex]
+                                    currentPoints.indices.forEach { i ->
+                                        val p = currentPoints[i]
+                                        if (p.x.isFinite() && p.y.isFinite() &&
+                                            abs(p.x - initialSelected.x) < 0.000001 &&
+                                            abs(p.y - initialSelected.y) < 0.000001) {
+                                            indicesToMove.add(i)
+                                            initialPositions[i] = p
                                         }
-                                        lineFound = true
+                                    }
+                                } else if (hitLineIndex != -1 && hitLineIndex < currentPoints.size - 1) {
+                                    val p1 = currentPoints[hitLineIndex]
+                                    val p2 = currentPoints[hitLineIndex + 1]
+                                    currentPoints.indices.forEach { i ->
+                                        val p = currentPoints[i]
+                                        if (p.x.isFinite() && p.y.isFinite()) {
+                                            val overlapsP1 = abs(p.x - p1.x) < 0.000001 && abs(p.y - p1.y) < 0.000001
+                                            val overlapsP2 = abs(p.x - p2.x) < 0.000001 && abs(p.y - p2.y) < 0.000001
+                                            if (overlapsP1 || overlapsP2) {
+                                                indicesToMove.add(i)
+                                                initialPositions[i] = p
+                                            }
+                                        }
                                     }
                                 }
 
-                                // Deselect All
-                                if (!lineFound) {
-                                    selectedPointIndex = -1
-                                    selectedLineIndex = -1
-                                    selectedAreaInfo = null
+                                var accumulatedRotDx = 0.0
+                                var accumulatedRotDy = 0.0
+                                var dragPointerId = down.id
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.find { it.id == dragPointerId }
+                                    if (change == null || !change.pressed) break
+
+                                    val dragAmount = change.position - change.previousPosition
+                                    if (dragAmount.getDistance() > 0f) {
+                                        val rad = (-rotation * (PI / 180.0)).toFloat()
+                                        val cosVal = cos(rad)
+                                        val sinVal = sin(rad)
+
+                                        val rotDx = (dragAmount.x * cosVal - dragAmount.y * sinVal) / latScaleFactor
+                                        val rotDy = -(dragAmount.x * sinVal + dragAmount.y * cosVal)
+
+                                        accumulatedRotDx += rotDx / scale
+                                        accumulatedRotDy += rotDy / scale
+
+                                        indicesToMove.forEach { idx ->
+                                            if (idx != lockedPointIndex) {
+                                                val initialPt = initialPositions[idx]
+                                                if (initialPt != null) {
+                                                    val newX = initialPt.x + accumulatedRotDx
+                                                    val newY = initialPt.y + accumulatedRotDy
+                                                    currentOnUpdatePoint(idx, newX, newY)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    change.consume()
+                                }
+                            } else {
+                                val up = waitForUpOrCancellation()
+                                if (up != null) {
+                                    if (isAddMode) {
+                                        val tapPos = screenToWorld(up.position)
+                                        viewModel.addPointIsolated(tapPos.x, tapPos.y)
+                                        isAddMode = false
+                                        selectedPointIndex = currentPoints.size
+                                    } else {
+                                        selectedPointIndex = -1
+                                        selectedLineIndex = -1
+                                        isConnectModePending = false
+                                    }
                                 }
                             }
                         }
                     }
                 }
         ) {
-            val canvasSize = size
-            // --- DRAWING ---
-            translate(left = offset.x, top = offset.y) {
-                rotate(degrees = rotation, pivot = Offset.Zero) {
-                    scale(scale = scale, pivot = Offset.Zero) {
+            val labelsToDraw = mutableListOf<Pair<Offset, String>>()
+            val pointMap = points.associateBy { it.id }
+            val isGPS = validPoints.isNotEmpty() && validPoints.all { abs(it.x) <= 180.0 && abs(it.y) <= 90.0 }
 
-                        // 1. Grid (Capped loop to prevent memory issues)
-                        val gridSize = 100f
-                        for (i in -200..200) {
-                            val pos = i * gridSize
-                            drawLine(gridLineColor, Offset(pos, -20000f), Offset(pos, 20000f))
-                            drawLine(gridLineColor, Offset(-20000f, pos), Offset(20000f, pos))
-                        }
+            if (isAreaMode && selectedAreaIndices.size > 1) {
+                for (i in 0 until selectedAreaIndices.size - 1) {
+                    val idx1 = selectedAreaIndices[i]
+                    val idx2 = selectedAreaIndices[i+1]
+                    if (idx1 < points.size && idx2 < points.size) {
+                        drawLine(areaPreviewLineColor, worldToScreen(points[idx1]), worldToScreen(points[idx2]), strokeWidth = 3f)
+                    }
+                }
+                if (selectedAreaIndices.size > 2) {
+                    val idxLast = selectedAreaIndices.last()
+                    val idxFirst = selectedAreaIndices.first()
+                    if (idxLast < points.size && idxFirst < points.size) {
+                        drawLine(areaPreviewLineColor, worldToScreen(points[idxLast]), worldToScreen(points[idxFirst]), strokeWidth = 3f)
+                    }
+                }
+            }
 
-                        val textSize = (14 / scale).coerceIn(4f, 40f).sp
+            if (showLines) {
+                if (points.size > 1) {
+                    for (i in 0 until points.size - 1) {
+                        val p1 = points[i]
+                        val p2 = points[i + 1]
+                        if (p1.x.isFinite() && p1.y.isFinite() && p2.x.isFinite() && p2.y.isFinite()) {
+                            val isLineSelected = (i == selectedLineIndex)
+                            val actualLineColor = if (isLineSelected) selectedColor else lineColor
+                            val lineWidth = if (isLineSelected) 8f else 4f
+                            val screenP1 = worldToScreen(p1)
+                            val screenP2 = worldToScreen(p2)
 
-                        // 2. Lines
-                        if (showLines && points.size > 1) {
-                            for (i in 0 until points.size - 1) {
-                                val p1 = points[i]
-                                val p2 = points[i + 1]
-                                drawLine(color = lineColor, start = Offset(p1.x, p1.y), end = Offset(p2.x, p2.y), strokeWidth = 3f / scale)
+                            drawLine(color = actualLineColor, start = screenP1, end = screenP2, strokeWidth = lineWidth)
 
-                                if (i == selectedLineIndex) {
-                                    val midX = (p1.x + p2.x) / 2
-                                    val midY = (p1.y + p2.y) / 2
-                                    val length = CsvDxfUtils.distance(p1, p2)
-                                    val text = "<-- ${"%.1f".format(length)} -->"
-
-                                    val angleRad = atan2(p2.y - p1.y, p2.x - p1.x)
-                                    var angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
-                                    if (angleDeg > 90 || angleDeg < -90) angleDeg += 180
-
-                                    // CRASH FIX: Bounds Check
-                                    val screenPos = worldToScreen(PointData(0, midX, midY))
-                                    if (screenPos.x > -200 && screenPos.x < canvasSize.width + 200 &&
-                                        screenPos.y > -200 && screenPos.y < canvasSize.height + 200) {
-                                        rotate(degrees = angleDeg, pivot = Offset(midX, midY)) {
-                                            drawText(textMeasurer = textMeasurer, text = text, topLeft = Offset(midX - (30 / scale), midY - (10 / scale)), style = TextStyle(color = textColor, fontSize = textSize, background = backgroundColor.copy(alpha = 0.8f)))
-                                        }
-                                    }
-                                }
-                            }
-                            if (points.size > 2) {
-                                val pLast = points.last()
-                                val pFirst = points.first()
-                                drawLine(lineColor.copy(alpha = 0.5f), Offset(pLast.x, pLast.y), Offset(pFirst.x, pFirst.y), strokeWidth = 2f / scale)
-                            }
-                        }
-
-                        // 3. Points
-                        points.forEachIndexed { index, point ->
-                            val isSelected = index == selectedPointIndex
-                            val radius = if (isSelected) 15f else 8f
-                            val color = if (isSelected) selectedColor else dotColor
-
-                            drawCircle(color = color, radius = radius / scale, center = Offset(point.x, point.y))
-
-                            if (isSelected) {
-                                // CRASH FIX: Bounds Check
-                                val screenPos = worldToScreen(point)
-                                if (screenPos.x > -200 && screenPos.x < canvasSize.width + 200 &&
-                                    screenPos.y > -200 && screenPos.y < canvasSize.height + 200) {
-
-                                    rotate(degrees = -rotation, pivot = Offset(point.x, point.y)) {
-                                        drawText(
-                                            textMeasurer = textMeasurer,
-                                            text = "(${point.x.toInt()}, ${point.y.toInt()})",
-                                            topLeft = Offset(point.x + (15 / scale), point.y - (25 / scale)),
-                                            style = TextStyle(color = selectedColor, fontSize = textSize, fontWeight = FontWeight.Bold, background = Color.Black.copy(alpha = 0.6f))
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        // 4. Area
-                        if (selectedAreaInfo != null && selectedAreaPos != null) {
-                            val screenPos = worldToScreen(selectedAreaPos!!)
-                            if (screenPos.x > -200 && screenPos.x < canvasSize.width + 200 &&
-                                screenPos.y > -200 && screenPos.y < canvasSize.height + 200) {
-                                rotate(degrees = -rotation, pivot = Offset(selectedAreaPos!!.x, selectedAreaPos!!.y)) {
-                                    drawText(textMeasurer = textMeasurer, text = selectedAreaInfo!!, topLeft = Offset(selectedAreaPos!!.x, selectedAreaPos!!.y), style = TextStyle(color = textColor, fontSize = textSize * 1.5, fontWeight = FontWeight.Bold, background = backgroundColor.copy(alpha = 0.8f)))
-                                }
+                            if (isLineSelected) {
+                                val length = if (isGPS) earthDistanceMeters(p1, p2) else CsvDxfUtils.distance(p1, p2)
+                                val unit = if (isGPS) "m" else "units"
+                                val midX = (p1.x + p2.x) / 2.0
+                                val midY = (p1.y + p2.y) / 2.0
+                                labelsToDraw.add(worldToScreen(PointData(0, midX, midY)) to "<-- ${"%.2f".format(length)} $unit -->")
                             }
                         }
                     }
                 }
+
+                customLines.forEach { (id1, id2) ->
+                    val p1 = pointMap[id1]
+                    val p2 = pointMap[id2]
+                    if (p1 != null && p2 != null && p1.x.isFinite() && p1.y.isFinite() && p2.x.isFinite() && p2.y.isFinite()) {
+                        drawLine(color = customLineColor, start = worldToScreen(p1), end = worldToScreen(p2), strokeWidth = 4f)
+                    }
+                }
+            }
+
+            points.forEachIndexed { index, point ->
+                if (point.x.isFinite() && point.y.isFinite()) {
+                    val isSelected = index == selectedPointIndex
+                    val isAreaSelected = isAreaMode && selectedAreaIndices.contains(index)
+                    val isConnectTarget = isConnectModePending && isSelected
+                    val isLocked = index == lockedPointIndex // NEW: Identify locked point
+
+                    val radius = if (isSelected || isAreaSelected || isLocked) 15f else 8f
+
+                    val color = if (isConnectTarget) Color.Red
+                    else if (isAreaSelected) areaSelectedDotColor
+                    else if (isLocked) Color.Magenta // Draw Locked point as highly visible Magenta
+                    else if (isSelected) selectedColor
+                    else dotColor
+
+                    val screenPos = worldToScreen(point)
+                    drawCircle(color = color, radius = radius, center = screenPos)
+
+                    // Draw inner white pin indicator for locked points
+                    if (isLocked) {
+                        drawCircle(color = Color.White, radius = radius * 0.4f, center = screenPos)
+                    }
+
+                    val showCoord = isSelected || (selectedLineIndex != -1 && (index == selectedLineIndex || index == selectedLineIndex + 1))
+                    if (showCoord) {
+                        labelsToDraw.add(screenPos to "(${String.format(Locale.US, "%.6f", point.x)}, ${String.format(Locale.US, "%.6f", point.y)})")
+                    }
+                }
+            }
+
+            if (selectedAreaInfo != null && selectedAreaPos != null) {
+                val pos = selectedAreaPos!!
+                if (pos.x.isFinite() && pos.y.isFinite()) {
+                    labelsToDraw.add(worldToScreen(pos) to selectedAreaInfo!!)
+                }
+            }
+
+            labelsToDraw.forEach { (screenPos, text) ->
+                if (isSafeToDraw(screenPos)) {
+                    try {
+                        val xOffset = if (screenPos.x > canvasWidth - 200) -250f else 40f
+                        drawText(
+                            textMeasurer = textMeasurer,
+                            text = text,
+                            topLeft = Offset(screenPos.x + xOffset, screenPos.y - 50f),
+                            style = TextStyle(color = selectedColor, fontSize = 14.sp, fontWeight = FontWeight.Bold, background = Color.Black.copy(alpha = 0.6f))
+                        )
+                    } catch (e: Exception) { }
+                }
             }
         }
 
-        // --- CONTROLS ---
-        Row(
+        IconButton(
+            onClick = onBack,
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilledTonalIconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-            }
-            FilledTonalIconButton(onClick = { showLines = !showLines }) {
-                Text(if (showLines) "📐" else "⚫")
-            }
-        }
-
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
+                .align(Alignment.TopStart)
                 .padding(16.dp)
-                .clip(RoundedCornerShape(16.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
-                .clickable { isMenuExpanded = !isMenuExpanded }
-                .padding(12.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f), RoundedCornerShape(50))
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    imageVector = if (isMenuExpanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
-                    contentDescription = "Toggle",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                AnimatedVisibility(visible = isMenuExpanded, enter = expandVertically(), exit = shrinkVertically()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly
-                    ) {
-                        Button(onClick = onOpenEditor) { Text("Data Editor") }
-                        Button(onClick = onExport) { Text("Export") }
-                        Button(onClick = onUndo, enabled = canUndo) { Text("Undo") }
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+        }
+
+        val isSelectionActive = selectedPointIndex != -1 || selectedLineIndex != -1
+        val showConnectOption = selectedPointIndex != -1
+        val showLockPointOption = selectedPointIndex != -1 || lockedPointIndex != -1
+        val isPointLocked = lockedPointIndex != -1
+
+        IconLayout(
+            modifier = Modifier.align(Alignment.BottomEnd),
+            isPortrait = isPortrait,
+            isSelectionActive = isSelectionActive,
+            onDeleteClick = {
+                if (selectedPointIndex != -1) {
+                    val sp = currentPoints[selectedPointIndex]
+                    val overlappingIndices = currentPoints.indices.filter {
+                        val p = currentPoints[it]
+                        p.x.isFinite() && p.y.isFinite() && abs(p.x - sp.x) < 0.000001 && abs(p.y - sp.y) < 0.000001
+                    }
+                    overlappingIndices.forEach { idx ->
+                        viewModel.deletePointWithGap(idx)
+                        if (lockedPointIndex == idx) lockedPointIndex = -1
                     }
                 }
-            }
-        }
+                else if (selectedLineIndex != -1) viewModel.breakLine(selectedLineIndex)
+                selectedPointIndex = -1
+                selectedLineIndex = -1
+                selectedAreaInfo = null
+            },
+            isAddMode = isAddMode,
+            onAddModeChange = { isAddMode = it },
+            showLines = showLines,
+            onShowLinesChange = { showLines = it },
+            showConnectOption = showConnectOption,
+            isConnectModePending = isConnectModePending,
+            onConnectModeChange = { isConnectModePending = it },
+            showLockPointOption = showLockPointOption,
+            isPointLocked = isPointLocked,
+            onLockPointToggle = { isLocked ->
+                lockedPointIndex = if (isLocked && selectedPointIndex != -1) selectedPointIndex else -1
+            },
+            isAreaMode = isAreaMode,
+            onAreaModeClick = {
+                if (isAreaMode) {
+                    val polyPoints = selectedAreaIndices.mapNotNull { idx ->
+                        if (idx in points.indices) points[idx] else null
+                    }
+                    if (polyPoints.size >= 3) {
+                        val area = AreaCalculation.calculateArea(polyPoints)
+                        val isGPS = polyPoints.all { abs(it.x) <= 180.0 && abs(it.y) <= 90.0 }
+                        val unit = if (isGPS) "m²" else "sq units"
+
+                        selectedAreaInfo = "Area: ${"%.2f".format(area)} $unit"
+
+                        var avgX = 0.0
+                        var avgY = 0.0
+                        polyPoints.forEach { avgX += it.x; avgY += it.y }
+                        selectedAreaPos = PointData(0, avgX / polyPoints.size, avgY / polyPoints.size)
+                        isAreaMode = false
+                        selectedAreaIndices.clear()
+                    } else {
+                        scope.launch { snackbarHostState.showSnackbar("Select at least 3 points") }
+                        isAreaMode = false
+                        selectedAreaIndices.clear()
+                    }
+                } else {
+                    isAreaMode = true
+                    selectedAreaInfo = null
+                    selectedAreaIndices.clear()
+                    selectedPointIndex = -1
+                    selectedLineIndex = -1
+                    isAddMode = false
+                    isConnectModePending = false
+                }
+            },
+            lockScroll = lockScroll,
+            onLockScrollChange = { lockScroll = it },
+            lockRotation = lockRotation,
+            onLockRotationChange = { lockRotation = it },
+            lockZoom = lockZoom,
+            onLockZoomChange = { lockZoom = it },
+            onOpenEditor = onOpenEditor,
+            canUndo = canUndo,
+            onUndo = onUndo,
+            onExport = onExport,
+            onOpen3DView = { show3DView = true }
+        )
+
+        SnackbarHost(hostState = snackbarHostState, modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
     }
 }
