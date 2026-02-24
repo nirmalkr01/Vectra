@@ -260,6 +260,19 @@ fun ViewerScreen(
                                         }
                                     }
                                 }
+                                // Check closing line (last point to first point) when polygon is closed
+                                if (hitLineIndex == -1 && currentPoints.size > 2) {
+                                    val firstPt = currentPoints.first()
+                                    val lastPt = currentPoints.last()
+                                    if (firstPt.x.isFinite() && firstPt.y.isFinite() &&
+                                        lastPt.x.isFinite() && lastPt.y.isFinite() &&
+                                        abs(firstPt.x - lastPt.x) < 0.000001 &&
+                                        abs(firstPt.y - lastPt.y) < 0.000001) {
+                                        if (CsvDxfUtils.distanceToSegment(worldPos, lastPt, firstPt) < hitRadius) {
+                                            hitLineIndex = currentPoints.size - 1
+                                        }
+                                    }
+                                }
                             }
 
                             if (hitPointIndex != -1 || hitLineIndex != -1) {
@@ -300,9 +313,9 @@ fun ViewerScreen(
                                             initialPositions[i] = p
                                         }
                                     }
-                                } else if (hitLineIndex != -1 && hitLineIndex < currentPoints.size - 1) {
+                                } else if (hitLineIndex != -1) {
                                     val p1 = currentPoints[hitLineIndex]
-                                    val p2 = currentPoints[hitLineIndex + 1]
+                                    val p2 = if (hitLineIndex == currentPoints.size - 1) currentPoints[0] else currentPoints[hitLineIndex + 1]
                                     currentPoints.indices.forEach { i ->
                                         val p = currentPoints[i]
                                         if (p.x.isFinite() && p.y.isFinite()) {
@@ -447,7 +460,8 @@ fun ViewerScreen(
                         drawCircle(color = Color.White, radius = radius * 0.4f, center = screenPos)
                     }
 
-                    val showCoord = isSelected || (selectedLineIndex != -1 && (index == selectedLineIndex || index == selectedLineIndex + 1))
+                    val isClosingLineEndpoint = selectedLineIndex == points.size - 1 && index == 0
+                    val showCoord = isSelected || (selectedLineIndex != -1 && (index == selectedLineIndex || index == selectedLineIndex + 1 || isClosingLineEndpoint))
                     if (showCoord) {
                         labelsToDraw.add(screenPos to "(${String.format(Locale.US, "%.6f", point.x)}, ${String.format(Locale.US, "%.6f", point.y)})")
                     }
