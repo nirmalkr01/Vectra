@@ -17,20 +17,18 @@ import java.util.UUID
 import kotlin.math.abs
 
 enum class AppStep {
-    START,          // Initial "+ Load" screen
-    MAPPING,        // Select X and Y columns
-    DUPLICATE_CHECK,// Check for overlapping lines
-    EDITOR,         // The list view (accessed via Viewer)
-    VIEWER          // The graph view (Main Screen)
+    START,
+    MAPPING,
+    DUPLICATE_CHECK,
+    EDITOR,
+    VIEWER
 }
 
-// Helper class for Undo History
 data class HistoryState(
     val points: List<PointData>,
     val lines: List<Pair<Int, Int>>
 )
 
-// Helper class for saving workspace sessions
 data class ProjectSession(
     val id: String,
     var name: String,
@@ -47,49 +45,41 @@ sealed class DuplicateAction {
 }
 
 data class DuplicateInfo(
-    val index1: Int, // Index of point A
-    val index2: Int, // Index of point B (Line 1 is A->B)
-    val index3: Int, // Index of point C (Line 2 is C->D)
-    val index4: Int, // Index of point D
-    val key: String  // Unique identifier for this overlap
+    val index1: Int,
+    val index2: Int,
+    val index3: Int,
+    val index4: Int,
+    val key: String
 )
 
 class VectraViewModel : ViewModel() {
 
-    // --- STATE ---
     var isDarkMode = mutableStateOf(true)
     var currentStep = mutableStateOf(AppStep.START)
 
-    // The main points list
     var points = mutableStateOf(listOf<PointData>())
         private set
 
-    // Store explicit connections between Point IDs (FromID, ToID)
     var lines = mutableStateOf(listOf<Pair<Int, Int>>())
 
-    // History for Undo (Stores both Points and Lines)
     private val history = mutableListOf<HistoryState>()
 
-    // Undo Availability
     var canUndo = mutableStateOf(false)
         private set
 
     var rawCsvData = mutableStateOf(listOf<List<String>>())
 
-    // Duplicate Detection State
     var duplicateGroup = mutableStateOf<DuplicateInfo?>(null)
     private val ignoredDuplicates = mutableSetOf<String>()
 
-    // --- PROJECT SESSIONS (Workspace History) ---
     val savedSessions = mutableStateListOf<ProjectSession>()
     private var currentSessionId: String? = null
-    private var pendingSessionName: String? = null // Holds the file name temporarily during import
+    private var pendingSessionName: String? = null
     private var isLoadedFromDisk = false
 
     private val PREFS_NAME = "VectraWorkspacePrefs"
     private val KEY_SESSIONS = "saved_sessions_data"
 
-    // --- DISK I/O LOGIC (Using basic Android JSON, no heavy libraries needed) ---
     fun saveSessionsToDisk(context: Context) {
         try {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -135,7 +125,7 @@ class VectraViewModel : ViewModel() {
     }
 
     fun loadSessionsFromDisk(context: Context) {
-        if (isLoadedFromDisk) return // Only load once
+        if (isLoadedFromDisk) return
 
         try {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -188,7 +178,6 @@ class VectraViewModel : ViewModel() {
         isLoadedFromDisk = true
     }
 
-    // Call this if the App goes to background to auto-save safely
     fun forceSaveCurrentState(context: Context) {
         if (currentSessionId != null && currentStep.value == AppStep.VIEWER) {
             val session = savedSessions.find { it.id == currentSessionId }
@@ -201,23 +190,20 @@ class VectraViewModel : ViewModel() {
         }
     }
 
-    // Call this to safely close the viewer and preserve data to history panel
     fun closeCurrentSession(context: Context) {
         forceSaveCurrentState(context)
         currentSessionId = null
         currentStep.value = AppStep.START
     }
 
-    // Call this to discard an incomplete import
     fun cancelImport() {
         currentSessionId = null
         pendingSessionName = null
         currentStep.value = AppStep.START
     }
 
-    // Call this from the MainScreen History Panel to open an existing project
     fun openSession(session: ProjectSession, context: Context) {
-        session.timestamp = System.currentTimeMillis() // Touch to make it "Recent"
+        session.timestamp = System.currentTimeMillis()
 
         points.value = session.points.toList()
         lines.value = session.lines.toList()
@@ -227,7 +213,6 @@ class VectraViewModel : ViewModel() {
         currentSessionId = session.id
         currentStep.value = AppStep.VIEWER
 
-        // Trigger recomposition to bump to Recent
         val updatedList = savedSessions.toList()
         savedSessions.clear()
         savedSessions.addAll(updatedList)
@@ -235,25 +220,18 @@ class VectraViewModel : ViewModel() {
         saveSessionsToDisk(context)
     }
 
-    // Call this from MainScreen to permanently delete a project from history
     fun deleteSession(sessionId: String, context: Context) {
         savedSessions.removeAll { it.id == sessionId }
         saveSessionsToDisk(context)
     }
 
-    // --- ACTIONS ---
-
-    fun previewCsvFile(uri: Uri, context: Context) {
+    // UPDATED: Dynamically checks if it is CSV or DXF
+    fun handleImportFile(uri: Uri, context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val contentResolver = context.contentResolver
-                val inputStream = contentResolver.openInputStream(uri)
-                val reader = BufferedReader(InputStreamReader(inputStream))
-                val csvContent = reader.use { it.readText() }
-                val rawRows = CsvDxfUtils.parseRawCsv(csvContent)
-
-                // Extract filename for project name (simple fallback to "New Project")
                 var fileName = "Imported Project"
+
                 val cursor = contentResolver.query(uri, null, null, null, null)
                 cursor?.use {
                     if (it.moveToFirst()) {
@@ -261,14 +239,41 @@ class VectraViewModel : ViewModel() {
                         if (displayNameIndex != -1) fileName = it.getString(displayNameIndex)
                     }
                 }
-
-                // Store temporarily. Do NOT add to savedSessions yet.
                 pendingSessionName = fileName
 
-                launch(Dispatchers.Main) {
-                    rawCsvData.value = rawRows
-                    currentStep.value = AppStep.MAPPING
+                val inputStream = contentResolver.openInputStream(uri)
+                val reader = BufferedReader(InputStreamReader(inputStream))
+                val fileContent = reader.use { it.readText() }
+
+                if (fileName.endsWith(".dxf", ignoreCase = true)) {
+                    // It's a DXF, process and skip mapping phase entirely
+                    val (dxfPoints, dxfLines) = CsvDxfUtils.parseDxf(fileContent)
+
+                    launch(Dispatchers.Main) {
+                        points.value = dxfPoints
+                        lines.value = dxfLines
+                        history.clear()
+                        canUndo.value = false
+                        ignoredDuplicates.clear()
+
+                        // Route through duplicate check directly to ensure overlapped boundaries combine correctly
+                        val dup = findDuplicateLine(dxfPoints)
+                        if (dup != null) {
+                            duplicateGroup.value = dup
+                            currentStep.value = AppStep.DUPLICATE_CHECK
+                        } else {
+                            finalizeImport(context)
+                        }
+                    }
+                } else {
+                    // Fallback to standard CSV Map Import
+                    val rawRows = CsvDxfUtils.parseRawCsv(fileContent)
+                    launch(Dispatchers.Main) {
+                        rawCsvData.value = rawRows
+                        currentStep.value = AppStep.MAPPING
+                    }
                 }
+
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -279,12 +284,11 @@ class VectraViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.Default) {
             val newPoints = CsvDxfUtils.mapToPoints(rawCsvData.value, xIndex, yIndex)
             points.value = newPoints
-            lines.value = emptyList() // Reset lines
+            lines.value = emptyList()
             history.clear()
             canUndo.value = false
-            ignoredDuplicates.clear() // Reset ignore list on new load
+            ignoredDuplicates.clear()
 
-            // Check for duplicates
             val dup = findDuplicateLine(newPoints)
             if (dup != null) {
                 duplicateGroup.value = dup
@@ -295,7 +299,6 @@ class VectraViewModel : ViewModel() {
         }
     }
 
-    // Call this when all mapping and checks are fully completed to formally create the session
     private fun finalizeImport(context: Context) {
         currentSessionId = UUID.randomUUID().toString()
         val newSession = ProjectSession(
@@ -312,7 +315,6 @@ class VectraViewModel : ViewModel() {
         currentStep.value = AppStep.VIEWER
     }
 
-    // Check if any two consecutive points form a line that is identical (reversed or same) to another pair
     private fun findDuplicateLine(pts: List<PointData>): DuplicateInfo? {
         if (pts.size < 4) return null
 
@@ -341,7 +343,6 @@ class VectraViewModel : ViewModel() {
     }
 
     private fun isSame(a: PointData, b: PointData): Boolean {
-        // High precision check for Double comparison
         return abs(a.x - b.x) < 0.0000001 && abs(a.y - b.y) < 0.0000001
     }
 
@@ -349,7 +350,6 @@ class VectraViewModel : ViewModel() {
         val dup = duplicateGroup.value ?: return
         val currentList = points.value.toMutableList()
 
-        // Using a Set to safely determine which indices to break without destroying shared points
         val indicesToClear = mutableSetOf<Int>()
 
         when (action) {
@@ -395,14 +395,14 @@ class VectraViewModel : ViewModel() {
             duplicateGroup.value = nextDup
         } else {
             duplicateGroup.value = null
-            finalizeImport(context) // Proceed to viewer and save session
+            finalizeImport(context)
         }
     }
 
     fun saveDxfFile(uri: Uri, contentResolver: ContentResolver) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val dxfContent = CsvDxfUtils.generateDxf(points.value)
+                val dxfContent = CsvDxfUtils.generateDxf(points.value, lines.value)
                 contentResolver.openOutputStream(uri)?.use { outputStream ->
                     outputStream.write(dxfContent.toByteArray())
                 }
@@ -412,7 +412,6 @@ class VectraViewModel : ViewModel() {
         }
     }
 
-    // --- HELPER: Get Separated Components ---
     fun getPolygons(): List<List<PointData>> {
         val result = mutableListOf<List<PointData>>()
         var currentPoly = mutableListOf<PointData>()
@@ -433,8 +432,6 @@ class VectraViewModel : ViewModel() {
         return result
     }
 
-    // --- EDITING & UNDO LOGIC ---
-
     fun saveStateForUndo() {
         if (history.size > 50) history.removeAt(0)
         history.add(HistoryState(points.value.toList(), lines.value.toList()))
@@ -454,9 +451,51 @@ class VectraViewModel : ViewModel() {
         if (saveHistory) saveStateForUndo()
         val currentList = points.value.toMutableList()
         if (index in currentList.indices) {
-            currentList[index] = currentList[index].copy(x = newX, y = newY)
+            val origX = currentList[index].x
+            val origY = currentList[index].y
+
+            for (i in currentList.indices) {
+                val p = currentList[i]
+                if (p.x.isFinite() && p.y.isFinite() && abs(p.x - origX) < 0.000001 && abs(p.y - origY) < 0.000001) {
+                    currentList[i] = p.copy(x = newX, y = newY)
+                }
+            }
             points.value = currentList
         }
+    }
+
+    fun updateLine(index1: Int, newX1: Double, newY1: Double, index2: Int, newX2: Double, newY2: Double, saveHistory: Boolean = false) {
+        if (saveHistory) saveStateForUndo()
+        val currentList = points.value.toMutableList()
+
+        val origX1 = currentList.getOrNull(index1)?.x
+        val origY1 = currentList.getOrNull(index1)?.y
+        val origX2 = currentList.getOrNull(index2)?.x
+        val origY2 = currentList.getOrNull(index2)?.y
+
+        if (origX1 != null && origY1 != null) {
+            for (i in currentList.indices) {
+                val p = currentList[i]
+                if (p.x.isFinite() && p.y.isFinite() && abs(p.x - origX1) < 0.000001 && abs(p.y - origY1) < 0.000001) {
+                    currentList[i] = p.copy(x = newX1, y = newY1)
+                }
+            }
+        }
+
+        if (origX2 != null && origY2 != null) {
+            for (i in currentList.indices) {
+                val p = currentList[i]
+                if (abs(origX1 ?: Double.MAX_VALUE - origX2) < 0.000001 && abs(origY1 ?: Double.MAX_VALUE - origY2) < 0.000001) {
+                    continue
+                }
+
+                if (p.x.isFinite() && p.y.isFinite() && abs(p.x - origX2) < 0.000001 && abs(p.y - origY2) < 0.000001) {
+                    currentList[i] = p.copy(x = newX2, y = newY2)
+                }
+            }
+        }
+
+        points.value = currentList
     }
 
     fun deletePoint(index: Int) {
@@ -464,9 +503,30 @@ class VectraViewModel : ViewModel() {
         val currentList = points.value.toMutableList()
         if (index in currentList.indices) {
             val pointId = currentList[index].id
-            currentList.removeAt(index)
+            val origX = currentList[index].x
+            val origY = currentList[index].y
+
+            val idsToRemove = mutableSetOf<Int>()
+            val indicesToRemove = mutableListOf<Int>()
+
+            for (i in currentList.indices) {
+                val p = currentList[i]
+                if (p.x.isFinite() && p.y.isFinite() && abs(p.x - origX) < 0.000001 && abs(p.y - origY) < 0.000001) {
+                    indicesToRemove.add(i)
+                    idsToRemove.add(p.id)
+                }
+            }
+
+            if (indicesToRemove.isEmpty()) {
+                currentList.removeAt(index)
+                lines.value = lines.value.filter { it.first != pointId && it.second != pointId }
+            } else {
+                indicesToRemove.sortedDescending().forEach { i ->
+                    currentList.removeAt(i)
+                }
+                lines.value = lines.value.filter { it.first !in idsToRemove && it.second !in idsToRemove }
+            }
             points.value = currentList
-            lines.value = lines.value.filter { it.first != pointId && it.second != pointId }
         }
     }
 
@@ -474,8 +534,15 @@ class VectraViewModel : ViewModel() {
         saveStateForUndo()
         val currentList = points.value.toMutableList()
         if (index in currentList.indices) {
-            val old = currentList[index]
-            currentList[index] = old.copy(x = Double.NaN, y = Double.NaN)
+            val origX = currentList[index].x
+            val origY = currentList[index].y
+
+            for (i in currentList.indices) {
+                val p = currentList[i]
+                if (p.x.isFinite() && p.y.isFinite() && abs(p.x - origX) < 0.000001 && abs(p.y - origY) < 0.000001) {
+                    currentList[i] = p.copy(x = Double.NaN, y = Double.NaN)
+                }
+            }
             points.value = currentList
         }
     }

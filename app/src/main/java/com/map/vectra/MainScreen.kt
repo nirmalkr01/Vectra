@@ -69,10 +69,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    val openCsvLauncher = rememberLauncherForActivityResult(
+    // UPDATED: Now supports any type of import so DXFs appear in the UI file picker
+    val openFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
-        uri?.let { viewModel.previewCsvFile(it, context) }
+        uri?.let { viewModel.handleImportFile(it, context) }
     }
 
     val createDxfLauncher = rememberLauncherForActivityResult(
@@ -123,7 +124,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     },
                     floatingActionButton = {
                         ExtendedFloatingActionButton(
-                            onClick = { openCsvLauncher.launch("text/*") },
+                            onClick = { openFileLauncher.launch("*/*") }, // Enables both CSVs and DXFs
                             icon = { Icon(Icons.Default.Add, contentDescription = "New Project") },
                             text = { Text("New", fontWeight = FontWeight.Bold) },
                             containerColor = MaterialTheme.colorScheme.primary,
@@ -252,7 +253,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     points = viewModel.points.value,
                     onBack = { viewModel.closeCurrentSession(context) }, // Preserves data and goes to START
                     onOpenEditor = { viewModel.currentStep.value = AppStep.EDITOR },
-                    onExport = { createDxfLauncher.launch("export.dxf") },
+                    onExport = {
+                        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                        createDxfLauncher.launch("Vectra_$timestamp.dxf")
+                    },
                     onUpdatePoint = { i, x, y -> viewModel.updatePoint(i, x, y, false) },
                     onSaveState = { viewModel.saveStateForUndo() },
                     onUndo = { viewModel.undo() },

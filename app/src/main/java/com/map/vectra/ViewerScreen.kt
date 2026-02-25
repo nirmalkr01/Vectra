@@ -1,9 +1,12 @@
 package com.map.vectra
 
 import android.content.res.Configuration
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -70,7 +73,9 @@ fun ViewerScreen(
     // Area
     var isAreaMode by remember { mutableStateOf(false) }
     val selectedAreaIndices = remember { mutableStateListOf<Int>() }
-    var selectedAreaInfo by remember { mutableStateOf<String?>(null) }
+    var calculatedBaseArea by remember { mutableStateOf<Double?>(null) }
+    var isGpsArea by remember { mutableStateOf(false) }
+    var selectedAreaUnit by remember { mutableIntStateOf(0) } // 0:m2, 1:ha, 2:ft2, 3:ac
     var selectedAreaPos by remember { mutableStateOf<PointData?>(null) }
 
     var showLines by remember { mutableStateOf(true) }
@@ -115,6 +120,32 @@ fun ViewerScreen(
         val c = 2 * atan2(sqrt(a), sqrt(1.0 - a))
         return earthRadius * c
     }
+
+    // Generate accurate Area Label dynamically based on Selected Unit
+    val displayAreaText = if (calculatedBaseArea != null) {
+        if (isGpsArea) {
+            val converted = when (selectedAreaUnit) {
+                0 -> calculatedBaseArea!!
+                1 -> calculatedBaseArea!! / 10000.0
+                2 -> calculatedBaseArea!! * 10.76391042
+                3 -> calculatedBaseArea!! / 4046.856422
+                else -> calculatedBaseArea!!
+            }
+            val unitStr = when (selectedAreaUnit) {
+                0 -> "m²"
+                1 -> "Hectares"
+                2 -> "ft²"
+                3 -> "Acres"
+                else -> ""
+            }
+            // Formatted Area to 3 decimal places
+            "Area: ${String.format(Locale.US, "%.3f", converted)} $unitStr"
+        } else {
+            // Formatted Area to 3 decimal places
+            "Area: ${String.format(Locale.US, "%.3f", calculatedBaseArea!!)} sq units"
+        }
+    } else null
+
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize().background(backgroundColor)) {
         val canvasWidth = constraints.maxWidth.toFloat()
@@ -181,6 +212,7 @@ fun ViewerScreen(
             val sx = rx * cosVal - ry * sinVal
             val sy = rx * sinVal + ry * cosVal
 
+            // Undo scaling and GPS curve correction, and invert Y back
             val dx = sx / (scale.toDouble() * latScaleFactor)
             val dy = -(sy / scale.toDouble())
 
@@ -226,14 +258,20 @@ fun ViewerScreen(
                 }
                 .pointerInput(isAddMode, isConnectModePending, isAreaMode, selectedPointIndex, lockedPointIndex) {
                     awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        val worldPos = screenToWorld(down.position)
+                        // Force requirement of unconsumed touches to respect Area Box UI
+                        val down = awaitFirstDown(requireUnconsumed = true)
 
+                        // Hide Area Overlay if user clicks exactly on the map
+                        if (calculatedBaseArea != null) {
+                            calculatedBaseArea = null
+                            selectedAreaPos = null
+                        }
+
+                        val worldPos = screenToWorld(down.position)
                         val hitRadius = (50.0 / scale.toDouble())
 
                         var hitPointIndex = currentPoints.indexOfFirst {
-                            it.x.isFinite() && it.y.isFinite() &&
-                                    CsvDxfUtils.distance(it, worldPos) < hitRadius
+                            it.x.isFinite() && it.y.isFinite() && CsvDxfUtils.distance(it, worldPos) < hitRadius
                         }
 
                         if (isAreaMode) {
@@ -245,7 +283,7 @@ fun ViewerScreen(
                                 } else {
                                     selectedAreaIndices.add(hitPointIndex)
                                 }
-                                selectedAreaInfo = null
+                                calculatedBaseArea = null
                             }
                         } else {
                             var hitLineIndex = -1
@@ -276,50 +314,24 @@ fun ViewerScreen(
                                     if (hitPointIndex != -1) {
                                         selectedPointIndex = hitPointIndex
                                         selectedLineIndex = -1
-                                        selectedAreaInfo = null
+                                        calculatedBaseArea = null
                                     } else {
                                         selectedLineIndex = hitLineIndex
                                         selectedPointIndex = -1
-                                        selectedAreaInfo = null
+                                        calculatedBaseArea = null
                                     }
                                     isConnectModePending = false
                                 }
 
-                                // Identify all points that need to move (treating overlapped points as a single entity)
-                                val indicesToMove = mutableSetOf<Int>()
-                                val initialPositions = mutableMapOf<Int, PointData>()
+                                // 1. SNAPSHOT STATE: Grab identical locked coordinates at exact moment of tap
+                                val initialPositions = currentPoints.map { it.copy() }
+                                val lockedP = initialPositions.getOrNull(lockedPointIndex)
 
-                                if (hitPointIndex != -1) {
-                                    val initialSelected = currentPoints[hitPointIndex]
-                                    currentPoints.indices.forEach { i ->
-                                        val p = currentPoints[i]
-                                        if (p.x.isFinite() && p.y.isFinite() &&
-                                            abs(p.x - initialSelected.x) < 0.000001 &&
-                                            abs(p.y - initialSelected.y) < 0.000001) {
-                                            indicesToMove.add(i)
-                                            initialPositions[i] = p
-                                        }
-                                    }
-                                } else if (hitLineIndex != -1 && hitLineIndex < currentPoints.size - 1) {
-                                    val p1 = currentPoints[hitLineIndex]
-                                    val p2 = currentPoints[hitLineIndex + 1]
-                                    currentPoints.indices.forEach { i ->
-                                        val p = currentPoints[i]
-                                        if (p.x.isFinite() && p.y.isFinite()) {
-                                            val overlapsP1 = abs(p.x - p1.x) < 0.000001 && abs(p.y - p1.y) < 0.000001
-                                            val overlapsP2 = abs(p.x - p2.x) < 0.000001 && abs(p.y - p2.y) < 0.000001
-                                            if (overlapsP1 || overlapsP2) {
-                                                indicesToMove.add(i)
-                                                initialPositions[i] = p
-                                            }
-                                        }
-                                    }
-                                }
-
-                                var accumulatedRotDx = 0.0
-                                var accumulatedRotDy = 0.0
                                 var dragPointerId = down.id
+                                var totalRotDx = 0.0
+                                var totalRotDy = 0.0
 
+                                // 2. DRAG LOOP
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     val change = event.changes.find { it.id == dragPointerId }
@@ -331,21 +343,44 @@ fun ViewerScreen(
                                         val cosVal = cos(rad)
                                         val sinVal = sin(rad)
 
-                                        val rotDx = (dragAmount.x * cosVal - dragAmount.y * sinVal) / latScaleFactor
-                                        val rotDy = -(dragAmount.x * sinVal + dragAmount.y * cosVal)
+                                        // Keep accumulating absolute translation independently of composition refresh
+                                        totalRotDx += (dragAmount.x * cosVal - dragAmount.y * sinVal) / latScaleFactor
+                                        totalRotDy += -(dragAmount.x * sinVal + dragAmount.y * cosVal)
 
-                                        accumulatedRotDx += rotDx / scale
-                                        accumulatedRotDy += rotDy / scale
+                                        if (hitPointIndex != -1) {
+                                            val initialP = initialPositions[hitPointIndex]
+                                            val isLocked = lockedP != null && abs(initialP.x - lockedP.x) < 0.000001 && abs(initialP.y - lockedP.y) < 0.000001
 
-                                        indicesToMove.forEach { idx ->
-                                            if (idx != lockedPointIndex) {
-                                                val initialPt = initialPositions[idx]
-                                                if (initialPt != null) {
-                                                    val newX = initialPt.x + accumulatedRotDx
-                                                    val newY = initialPt.y + accumulatedRotDy
-                                                    currentOnUpdatePoint(idx, newX, newY)
-                                                }
+                                            // Apply absolute translation to Viewmodel.
+                                            // The ViewModel will now handle auto-syncing the overlapping counterparts safely.
+                                            if (!isLocked) {
+                                                currentOnUpdatePoint(
+                                                    hitPointIndex,
+                                                    initialP.x + (totalRotDx / scale),
+                                                    initialP.y + (totalRotDy / scale)
+                                                )
                                             }
+                                        } else if (hitLineIndex != -1) {
+                                            val p1Initial = initialPositions[hitLineIndex]
+                                            val p2Initial = initialPositions[hitLineIndex + 1]
+
+                                            val isP1Locked = lockedP != null && abs(p1Initial.x - lockedP.x) < 0.000001 && abs(p1Initial.y - lockedP.y) < 0.000001
+                                            val isP2Locked = lockedP != null && abs(p2Initial.x - lockedP.x) < 0.000001 && abs(p2Initial.y - lockedP.y) < 0.000001
+
+                                            val dx = totalRotDx / scale
+                                            val dy = totalRotDy / scale
+
+                                            val finalX1 = if (isP1Locked) p1Initial.x else p1Initial.x + dx
+                                            val finalY1 = if (isP1Locked) p1Initial.y else p1Initial.y + dy
+
+                                            val finalX2 = if (isP2Locked) p2Initial.x else p2Initial.x + dx
+                                            val finalY2 = if (isP2Locked) p2Initial.y else p2Initial.y + dy
+
+                                            viewModel.updateLine(
+                                                hitLineIndex, finalX1, finalY1,
+                                                hitLineIndex + 1, finalX2, finalY2,
+                                                false
+                                            )
                                         }
                                     }
                                     change.consume()
@@ -404,12 +439,54 @@ fun ViewerScreen(
 
                             drawLine(color = actualLineColor, start = screenP1, end = screenP2, strokeWidth = lineWidth)
 
-                            if (isLineSelected) {
+                            // EXCLUSIVE LINE DRAWING LOGIC
+                            // Only show distance if the line is selected AND no point is actively selected.
+                            if (isLineSelected && selectedPointIndex == -1) {
                                 val length = if (isGPS) earthDistanceMeters(p1, p2) else CsvDxfUtils.distance(p1, p2)
                                 val unit = if (isGPS) "m" else "units"
-                                val midX = (p1.x + p2.x) / 2.0
-                                val midY = (p1.y + p2.y) / 2.0
-                                labelsToDraw.add(worldToScreen(PointData(0, midX, midY)) to "<-- ${"%.2f".format(length)} $unit -->")
+
+                                val midX = (screenP1.x + screenP2.x) / 2f
+                                val midY = (screenP1.y + screenP2.y) / 2f
+
+                                // Formatted distance to 3 decimal places
+                                val text = "<-- ${String.format(Locale.US, "%.3f", length)} $unit -->"
+
+                                val textLayoutResult = textMeasurer.measure(
+                                    text = text,
+                                    style = TextStyle(
+                                        color = selectedColor,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        background = Color.Black.copy(alpha = 0.6f)
+                                    )
+                                )
+
+                                // Calculate angle of the line in degrees for rotation
+                                val dx = screenP2.x - screenP1.x
+                                val dy = screenP2.y - screenP1.y
+                                var visualAngleDegrees = atan2(dy, dx) * (180f / PI.toFloat())
+
+                                // Keep text readable left-to-right
+                                if (visualAngleDegrees > 90f || visualAngleDegrees < -90f) {
+                                    visualAngleDegrees += 180f
+                                }
+
+                                // Use pivot = Offset.Zero so we rotate perfectly around the line's center point
+                                translate(left = midX, top = midY) {
+                                    rotate(degrees = visualAngleDegrees, pivot = Offset.Zero) {
+                                        // tx centers the text horizontally on the pivot
+                                        val tx = -textLayoutResult.size.width / 2f
+
+                                        // ty pushes the text vertically "up" relative to the rotated line.
+                                        // The 15f offset is absolute screen pixels, unaffected by map zoom.
+                                        val ty = -textLayoutResult.size.height.toFloat() - 15f
+
+                                        drawText(
+                                            textLayoutResult = textLayoutResult,
+                                            topLeft = Offset(tx, ty)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -424,44 +501,52 @@ fun ViewerScreen(
                 }
             }
 
+            val activeSp = points.getOrNull(selectedPointIndex)
+            val activeLp = points.getOrNull(lockedPointIndex)
+
             points.forEachIndexed { index, point ->
                 if (point.x.isFinite() && point.y.isFinite()) {
-                    val isSelected = index == selectedPointIndex
-                    val isAreaSelected = isAreaMode && selectedAreaIndices.contains(index)
+                    // Coordinates matched selection mapping handles exact overlap grouping natively
+                    val isSelected = activeSp != null && abs(point.x - activeSp.x) < 0.000001 && abs(point.y - activeSp.y) < 0.000001
+                    val isLocked = activeLp != null && abs(point.x - activeLp.x) < 0.000001 && abs(point.y - activeLp.y) < 0.000001
+                    val isAreaSelected = isAreaMode && selectedAreaIndices.any { areaIdx ->
+                        val ap = points.getOrNull(areaIdx)
+                        ap != null && abs(point.x - ap.x) < 0.000001 && abs(point.y - ap.y) < 0.000001
+                    }
                     val isConnectTarget = isConnectModePending && isSelected
-                    val isLocked = index == lockedPointIndex // NEW: Identify locked point
 
                     val radius = if (isSelected || isAreaSelected || isLocked) 15f else 8f
 
                     val color = if (isConnectTarget) Color.Red
                     else if (isAreaSelected) areaSelectedDotColor
-                    else if (isLocked) Color.Magenta // Draw Locked point as highly visible Magenta
+                    else if (isLocked) Color.Magenta
                     else if (isSelected) selectedColor
                     else dotColor
 
                     val screenPos = worldToScreen(point)
                     drawCircle(color = color, radius = radius, center = screenPos)
 
-                    // Draw inner white pin indicator for locked points
                     if (isLocked) {
                         drawCircle(color = Color.White, radius = radius * 0.4f, center = screenPos)
                     }
 
-                    val showCoord = isSelected || (selectedLineIndex != -1 && (index == selectedLineIndex || index == selectedLineIndex + 1))
-                    if (showCoord) {
-                        labelsToDraw.add(screenPos to "(${String.format(Locale.US, "%.6f", point.x)}, ${String.format(Locale.US, "%.6f", point.y)})")
+                    // EXCLUSIVE POINT LOGIC
+                    // Formatting coordinates to exactly 7 decimal places
+                    if (isSelected) {
+                        labelsToDraw.add(screenPos to "(${String.format(Locale.US, "%.7f", point.x)}, ${String.format(Locale.US, "%.7f", point.y)})")
                     }
                 }
             }
 
-            if (selectedAreaInfo != null && selectedAreaPos != null) {
+            if (displayAreaText != null && selectedAreaPos != null) {
                 val pos = selectedAreaPos!!
                 if (pos.x.isFinite() && pos.y.isFinite()) {
-                    labelsToDraw.add(worldToScreen(pos) to selectedAreaInfo!!)
+                    labelsToDraw.add(worldToScreen(pos) to displayAreaText)
                 }
             }
 
-            labelsToDraw.forEach { (screenPos, text) ->
+            // Distinct deduplicates any overlapping label texts seamlessly
+            labelsToDraw.distinct().forEach { (screenPos, text) ->
                 if (isSafeToDraw(screenPos)) {
                     try {
                         val xOffset = if (screenPos.x > canvasWidth - 200) -250f else 40f
@@ -472,6 +557,58 @@ fun ViewerScreen(
                             style = TextStyle(color = selectedColor, fontSize = 14.sp, fontWeight = FontWeight.Bold, background = Color.Black.copy(alpha = 0.6f))
                         )
                     } catch (e: Exception) { }
+                }
+            }
+        }
+
+        // Overlay Parameter Box handling the Unit conversions
+        if (calculatedBaseArea != null) {
+            Card(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 80.dp)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {} // Intercepts clicks so canvas does NOT hide it
+                    ),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f)),
+                elevation = CardDefaults.cardElevation(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Area Parameters", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, fontSize = 16.sp)
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (isGpsArea) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("m²", "Hectares", "ft²", "Acres").forEachIndexed { index, label ->
+                                Surface(
+                                    modifier = Modifier.clickable { selectedAreaUnit = index },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (selectedAreaUnit == index) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                                ) {
+                                    Text(
+                                        text = label,
+                                        color = if (selectedAreaUnit == index) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = "Standard Coordinate Area (No Unit Conversion)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -497,20 +634,16 @@ fun ViewerScreen(
             isSelectionActive = isSelectionActive,
             onDeleteClick = {
                 if (selectedPointIndex != -1) {
-                    val sp = currentPoints[selectedPointIndex]
-                    val overlappingIndices = currentPoints.indices.filter {
-                        val p = currentPoints[it]
-                        p.x.isFinite() && p.y.isFinite() && abs(p.x - sp.x) < 0.000001 && abs(p.y - sp.y) < 0.000001
-                    }
-                    overlappingIndices.forEach { idx ->
-                        viewModel.deletePointWithGap(idx)
-                        if (lockedPointIndex == idx) lockedPointIndex = -1
-                    }
+                    viewModel.deletePointWithGap(selectedPointIndex)
+                    selectedPointIndex = -1
+                    calculatedBaseArea = null
+                    lockedPointIndex = -1
                 }
-                else if (selectedLineIndex != -1) viewModel.breakLine(selectedLineIndex)
-                selectedPointIndex = -1
-                selectedLineIndex = -1
-                selectedAreaInfo = null
+                else if (selectedLineIndex != -1) {
+                    viewModel.breakLine(selectedLineIndex)
+                    selectedLineIndex = -1
+                    calculatedBaseArea = null
+                }
             },
             isAddMode = isAddMode,
             onAddModeChange = { isAddMode = it },
@@ -533,14 +666,16 @@ fun ViewerScreen(
                     if (polyPoints.size >= 3) {
                         val area = AreaCalculation.calculateArea(polyPoints)
                         val isGPS = polyPoints.all { abs(it.x) <= 180.0 && abs(it.y) <= 90.0 }
-                        val unit = if (isGPS) "m²" else "sq units"
 
-                        selectedAreaInfo = "Area: ${"%.2f".format(area)} $unit"
+                        calculatedBaseArea = area
+                        isGpsArea = isGPS
+                        selectedAreaUnit = 0
 
                         var avgX = 0.0
                         var avgY = 0.0
                         polyPoints.forEach { avgX += it.x; avgY += it.y }
                         selectedAreaPos = PointData(0, avgX / polyPoints.size, avgY / polyPoints.size)
+
                         isAreaMode = false
                         selectedAreaIndices.clear()
                     } else {
@@ -550,7 +685,8 @@ fun ViewerScreen(
                     }
                 } else {
                     isAreaMode = true
-                    selectedAreaInfo = null
+                    calculatedBaseArea = null
+                    selectedAreaPos = null
                     selectedAreaIndices.clear()
                     selectedPointIndex = -1
                     selectedLineIndex = -1
